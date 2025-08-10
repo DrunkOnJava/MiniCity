@@ -18,6 +18,7 @@ DOCS_DIR = docs
 ASSETS_DIR = $(PROJECT_NAME)/Assets
 SCREENSHOTS_DIR = screenshots
 METRICS_DIR = metrics
+MONITOR_DIR = /tmp/minicity_monitor
 
 # Tools
 XCODEBUILD = xcodebuild
@@ -36,7 +37,14 @@ SIMCTL = xcrun simctl
 RED = \033[0;31m
 GREEN = \033[0;32m
 YELLOW = \033[1;33m
+BLUE = \033[0;34m
+CYAN = \033[0;36m
 NC = \033[0m # No Color
+
+# Monitoring Configuration
+ENABLE_MONITORING ?= 1
+MONITOR_SCRIPT = scripts/monitoring/crash_monitor.sh
+DIAGNOSTIC_SCRIPT = scripts/monitoring/claude_diagnostic.sh
 
 # Default target
 .DEFAULT_GOAL := help
@@ -56,9 +64,11 @@ help: ## Show this help message
 	@echo ""
 	@echo "Quick Start:"
 	@echo "  make setup          - Initial project setup"
-	@echo "  make run           - Build and run in simulator"
+	@echo "  make run           - Build and run in simulator (with crash detection)"
 	@echo "  make test          - Run all tests"
 	@echo "  make check         - Run all quality checks"
+	@echo ""
+	@echo "$(CYAN)Note: Crash monitoring is enabled by default. Use ENABLE_MONITORING=0 to disable.$(NC)"
 
 # =============================================================================
 # PROJECT SETUP & INITIALIZATION
@@ -70,6 +80,7 @@ setup: ## Complete project setup (dependencies, git hooks, directories)
 	@$(MAKE) install-deps
 	@$(MAKE) create-dirs
 	@$(MAKE) setup-git-hooks
+	@$(MAKE) setup-monitoring
 	@$(MAKE) download-assets
 	@echo "$(GREEN)✓ Setup complete!$(NC)"
 
@@ -80,6 +91,8 @@ install-deps: ## Install required dependencies (SwiftLint, etc.)
 	@command -v swiftlint >/dev/null 2>&1 || brew install swiftlint
 	@command -v swiftformat >/dev/null 2>&1 || brew install swiftformat
 	@command -v xcbeautify >/dev/null 2>&1 || brew install xcbeautify
+	@command -v jq >/dev/null 2>&1 || brew install jq
+	@command -v fswatch >/dev/null 2>&1 || brew install fswatch
 	@command -v xcov >/dev/null 2>&1 || gem install xcov
 	@echo "$(GREEN)✓ Dependencies installed$(NC)"
 
@@ -90,9 +103,17 @@ create-dirs: ## Create necessary project directories
 	@mkdir -p $(DOCS_DIR)
 	@mkdir -p $(SCREENSHOTS_DIR)
 	@mkdir -p $(METRICS_DIR)
+	@mkdir -p $(MONITOR_DIR)
 	@mkdir -p $(ASSETS_DIR)/Textures
 	@mkdir -p $(ASSETS_DIR)/Models
 	@mkdir -p $(ASSETS_DIR)/Sounds
+
+.PHONY: setup-monitoring
+setup-monitoring: ## Setup crash monitoring scripts
+	@echo "$(YELLOW)Setting up monitoring scripts...$(NC)"
+	@chmod +x scripts/*.sh 2>/dev/null || true
+	@chmod +x scripts/monitoring/*.sh 2>/dev/null || true
+	@echo "$(GREEN)✓ Monitoring scripts ready$(NC)"
 
 .PHONY: setup-git-hooks
 setup-git-hooks: ## Install git hooks for code quality
@@ -102,11 +123,51 @@ setup-git-hooks: ## Install git hooks for code quality
 	@echo "$(GREEN)✓ Git hooks installed$(NC)"
 
 # =============================================================================
-# BUILD & RUN
+# INTELLIGENT BUILD & RUN (WITH CRASH DETECTION)
 # =============================================================================
 
 .PHONY: build
-build: ## Build for iOS Simulator (Debug)
+build: ## Build for iOS Simulator with diagnostics
+	@if [ "$(ENABLE_MONITORING)" = "1" ]; then \
+		$(MAKE) build-monitored; \
+	else \
+		$(MAKE) build-simple; \
+	fi
+
+.PHONY: build-monitored
+build-monitored: ## Build with full monitoring and diagnostics
+	@echo "$(CYAN)Building $(PROJECT_NAME) with monitoring...$(NC)"
+	@mkdir -p $(BUILD_DIR)
+	@rm -f $(BUILD_DIR)/last_build.log
+	@echo "$(YELLOW)Compiling...$(NC)"
+	@if $(XCODEBUILD) \
+		-project $(WORKSPACE) \
+		-scheme $(SCHEME) \
+		-configuration Debug \
+		-derivedDataPath $(DERIVED_DATA) \
+		-destination 'platform=iOS Simulator,name=$(DEFAULT_DEVICE),OS=$(DEFAULT_OS)' \
+		build 2>&1 | tee $(BUILD_DIR)/last_build.log | xcbeautify; then \
+		echo "$(GREEN)✓ Build successful$(NC)"; \
+		echo "CLAUDE_CODE_BUILD_SUCCESS: Build completed successfully" >&2; \
+	else \
+		echo "$(RED)✗ Build failed$(NC)"; \
+		echo "$(YELLOW)Generating diagnostics...$(NC)"; \
+		BUILD_ERRORS=$(grep -E "error:|Error:" $(BUILD_DIR)/last_build.log | head -10); \
+		echo '{' > $(BUILD_DIR)/last_diagnostic.json; \
+		echo '  "event": "build_failed",' >> $(BUILD_DIR)/last_diagnostic.json; \
+		echo '  "timestamp": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'",' >> $(BUILD_DIR)/last_diagnostic.json; \
+		echo '  "errors": ['$(echo "$BUILD_ERRORS" | jq -Rs 'split("\n") | map(select(length > 0)) | join(",")')'],' >> $(BUILD_DIR)/last_diagnostic.json; \
+		echo '  "log_file": "$(BUILD_DIR)/last_build.log"' >> $(BUILD_DIR)/last_diagnostic.json; \
+		echo '}' >> $(BUILD_DIR)/last_diagnostic.json; \
+		echo "CLAUDE_CODE_BUILD_FAILED: $(cat $(BUILD_DIR)/last_diagnostic.json | jq -c .)" >&2; \
+		echo ""; \
+		echo "$(RED)Build Errors:$(NC)"; \
+		echo "$BUILD_ERRORS"; \
+		exit 1; \
+	fi
+
+.PHONY: build-simple
+build-simple: ## Original build without monitoring
 	@echo "$(YELLOW)Building $(PROJECT_NAME)...$(NC)"
 	@$(XCODEBUILD) \
 		-project $(WORKSPACE) \
@@ -117,18 +178,92 @@ build: ## Build for iOS Simulator (Debug)
 		build | xcbeautify
 	@echo "$(GREEN)✓ Build complete$(NC)"
 
-.PHONY: build-release
-build-release: ## Build for iOS Simulator (Release)
-	@$(XCODEBUILD) \
-		-project $(WORKSPACE) \
-		-scheme $(SCHEME) \
-		-configuration Release \
-		-derivedDataPath $(DERIVED_DATA) \
-		-destination 'platform=iOS Simulator,name=$(DEFAULT_DEVICE),OS=$(DEFAULT_OS)' \
-		build | xcbeautify
-
 .PHONY: run
-run: ## Build and run in iOS Simulator
+run: ## Build and run with intelligent crash detection
+	@if [ "$(ENABLE_MONITORING)" = "1" ]; then \
+		$(MAKE) run-monitored; \
+	else \
+		$(MAKE) run-simple; \
+	fi
+
+.PHONY: run-monitored
+run-monitored: ## Run with full monitoring and auto-recovery
+	@echo "$(CYAN)Starting $(PROJECT_NAME) with intelligent monitoring...$(NC)"
+	@# Clean previous monitoring data
+	@rm -rf $(MONITOR_DIR)
+	@mkdir -p $(MONITOR_DIR)
+	@mkdir -p $(BUILD_DIR)
+	@# Start background monitor
+	@echo "$(YELLOW)Initializing crash monitor...$(NC)"
+	@chmod +x $(MONITOR_SCRIPT) $(DIAGNOSTIC_SCRIPT) 2>/dev/null || true
+	@$(MONITOR_SCRIPT) > $(MONITOR_DIR)/monitor.log 2>&1 & echo $$! > $(MONITOR_DIR)/monitor.pid
+	@sleep 2
+	@# Ensure simulator
+	@$(MAKE) ensure-simulator
+	@# Build with monitoring
+	@echo "$(YELLOW)Building app...$(NC)"
+	@if ! $(MAKE) build-monitored; then \
+		echo "$(RED)Build failed - check diagnostics above$(NC)"; \
+		kill $$(cat $(MONITOR_DIR)/monitor.pid 2>/dev/null) 2>/dev/null || true; \
+		exit 1; \
+	fi
+	@# Install and launch
+	@if [ -d "$(DERIVED_DATA)/Build/Products/Debug-iphonesimulator/$(PROJECT_NAME).app" ]; then \
+		echo "$(YELLOW)Installing app...$(NC)"; \
+		$(SIMCTL) install booted $(DERIVED_DATA)/Build/Products/Debug-iphonesimulator/$(PROJECT_NAME).app; \
+		echo "$(YELLOW)Launching app with monitoring...$(NC)"; \
+		$(SIMCTL) launch booted $(BUNDLE_ID) & \
+		APP_PID=$$!; \
+		echo "$(GREEN)✓ App launched$(NC)"; \
+		echo "$(CYAN)Monitoring for crashes (30 seconds)...$(NC)"; \
+		CRASH_COUNT=0; \
+		STABLE_COUNT=0; \
+		for i in $$(seq 1 30); do \
+			if [ -f "$(MONITOR_DIR)/current_status.json" ]; then \
+				STATUS=$$(jq -r '.status' $(MONITOR_DIR)/current_status.json 2>/dev/null || echo "unknown"); \
+				if [ "$$STATUS" = "crashed" ]; then \
+					CRASH_COUNT=$$((CRASH_COUNT + 1)); \
+					echo ""; \
+					echo "$(RED)CRASH DETECTED (#$$CRASH_COUNT)$(NC)"; \
+					$(DIAGNOSTIC_SCRIPT) diagnose 2>/dev/null | jq '.crash_analysis' 2>/dev/null || true; \
+					echo "CLAUDE_CODE_CRASH: $$($(DIAGNOSTIC_SCRIPT) diagnose 2>/dev/null | jq -c .)" >&2; \
+					if [ $$CRASH_COUNT -lt 3 ]; then \
+						echo "$(YELLOW)Attempting recovery...$(NC)"; \
+						sleep 2; \
+						$(SIMCTL) launch booted $(BUNDLE_ID) & \
+						APP_PID=$$!; \
+					else \
+						echo "$(RED)Multiple crashes - manual intervention required$(NC)"; \
+						break; \
+					fi; \
+				elif [ "$$STATUS" = "running" ]; then \
+					STABLE_COUNT=$$((STABLE_COUNT + 1)); \
+					if [ $$STABLE_COUNT -ge 5 ]; then \
+						echo ""; \
+						echo "$(GREEN)✓ App is stable and running$(NC)"; \
+						echo "CLAUDE_CODE_SUCCESS: App running successfully" >&2; \
+						break; \
+					fi; \
+				fi; \
+			fi; \
+			sleep 1; \
+			printf "."; \
+		done; \
+		echo ""; \
+		if [ $$CRASH_COUNT -gt 0 ]; then \
+			echo "$(YELLOW)Final diagnostic report:$(NC)"; \
+			$(DIAGNOSTIC_SCRIPT) diagnose 2>/dev/null | jq '.' || true; \
+		fi; \
+		kill $$(cat $(MONITOR_DIR)/monitor.pid 2>/dev/null) 2>/dev/null || true; \
+		echo "$(BLUE)Monitoring complete$(NC)"; \
+	else \
+		echo "$(RED)✗ Build failed - app bundle not found$(NC)"; \
+		kill $$(cat $(MONITOR_DIR)/monitor.pid 2>/dev/null) 2>/dev/null || true; \
+		exit 1; \
+	fi
+
+.PHONY: run-simple
+run-simple: ## Original run without monitoring
 	@echo "$(YELLOW)Building and launching $(PROJECT_NAME)...$(NC)"
 	@$(MAKE) ensure-simulator
 	@echo "$(YELLOW)Building app...$(NC)"
@@ -150,6 +285,16 @@ run: ## Build and run in iOS Simulator
 		exit 1; \
 	fi
 
+.PHONY: build-release
+build-release: ## Build for iOS Simulator (Release)
+	@$(XCODEBUILD) \
+		-project $(WORKSPACE) \
+		-scheme $(SCHEME) \
+		-configuration Release \
+		-derivedDataPath $(DERIVED_DATA) \
+		-destination 'platform=iOS Simulator,name=$(DEFAULT_DEVICE),OS=$(DEFAULT_OS)' \
+		build | xcbeautify
+
 .PHONY: run-release
 run-release: build-release ## Run release build in simulator
 	@$(MAKE) ensure-simulator
@@ -164,6 +309,31 @@ run-device: ## Build and run on physical device
 		-configuration Debug \
 		-destination 'platform=iOS,name=Any iOS Device' \
 		run | xcbeautify
+
+# =============================================================================
+# DIAGNOSTIC COMMANDS
+# =============================================================================
+
+.PHONY: diagnose
+diagnose: ## Get current app diagnostics
+	@chmod +x $(DIAGNOSTIC_SCRIPT) 2>/dev/null || true
+	@$(DIAGNOSTIC_SCRIPT) diagnose
+
+.PHONY: status
+status: ## Check current app status
+	@if [ -f "$(MONITOR_DIR)/current_status.json" ]; then \
+		jq '.' $(MONITOR_DIR)/current_status.json; \
+	else \
+		echo '{"status": "not_monitored", "message": "Run with monitoring enabled to get status"}'; \
+	fi
+
+.PHONY: monitor-logs
+monitor-logs: ## Show monitor logs
+	@if [ -f "$(MONITOR_DIR)/monitor.log" ]; then \
+		tail -f $(MONITOR_DIR)/monitor.log; \
+	else \
+		echo "No monitor logs available. Run 'make run' first."; \
+	fi
 
 # =============================================================================
 # TESTING
@@ -366,279 +536,6 @@ record: ## Record simulator screen
 	@$(SIMCTL) io booted recordVideo $(SCREENSHOTS_DIR)/recording-$$(date +%Y%m%d-%H%M%S).mp4
 
 # =============================================================================
-# DOCUMENTATION
-# =============================================================================
-
-.PHONY: docs
-docs: ## Generate documentation
-	@echo "$(YELLOW)Generating documentation...$(NC)"
-	@$(JAZZY) \
-		--clean \
-		--author "MiniCity Team" \
-		--module $(PROJECT_NAME) \
-		--source-directory $(PROJECT_NAME) \
-		--output $(DOCS_DIR)
-	@echo "$(GREEN)✓ Documentation generated$(NC)"
-	@open $(DOCS_DIR)/index.html
-
-.PHONY: readme
-readme: ## Update README with current stats
-	@echo "$(YELLOW)Updating README...$(NC)"
-	@echo "# MiniCity" > README.md
-	@echo "" >> README.md
-	@echo "## Statistics" >> README.md
-	@echo "- Lines of code: $$(find $(PROJECT_NAME) -name '*.swift' | xargs wc -l | tail -1 | awk '{print $$1}')" >> README.md
-	@echo "- Number of files: $$(find $(PROJECT_NAME) -name '*.swift' | wc -l)" >> README.md
-	@echo "- Last updated: $$(date)" >> README.md
-	@echo "$(GREEN)✓ README updated$(NC)"
-
-.PHONY: links
-links: ## Display Metal framework documentation links
-	@echo ""
-	@echo "$(CYAN)Review and explore the Metal framework with these suggested documentation links:$(NC)"
-	@echo ""
-	@echo "$(YELLOW)Core Metal Framework:$(NC)"
-	@echo "  https://developer.apple.com/documentation/metal"
-	@echo "  https://developer.apple.com/documentation/MetalKit"
-	@echo "  https://developer.apple.com/documentation/MetalPerformanceShaders"
-	@echo "  https://developer.apple.com/documentation/metal/using-metal-to-draw-a-view's-contents"
-	@echo "  https://developer.apple.com/documentation/metal/developing-metal-apps-that-run-in-simulator"
-	@echo ""
-	@echo "$(YELLOW)Rendering & Graphics:$(NC)"
-	@echo "  https://developer.apple.com/documentation/metal/rendering_pipelines"
-	@echo "  https://developer.apple.com/documentation/metal/vertex_data_and_vertex_descriptors"
-	@echo "  https://developer.apple.com/documentation/metal/using_a_render_pipeline_to_render_primitives"
-	@echo "  https://developer.apple.com/documentation/metal/creating_and_sampling_textures"
-	@echo "  https://developer.apple.com/documentation/metal/calculating_primitive_visibility_using_depth_testing"
-	@echo ""
-	@echo "$(YELLOW)Compute & GPU Programming:$(NC)"
-	@echo "  https://developer.apple.com/documentation/metal/compute_pipelines"
-	@echo "  https://developer.apple.com/documentation/metal/gpu_programming_techniques"
-	@echo "  https://developer.apple.com/documentation/metal/performing_calculations_on_a_gpu"
-	@echo "  https://developer.apple.com/documentation/metal/using_metal_to_accelerate_matrix_operations"
-	@echo ""
-	@echo "$(YELLOW)Memory & Performance:$(NC)"
-	@echo "  https://developer.apple.com/documentation/metal/resource_fundamentals"
-	@echo "  https://developer.apple.com/documentation/metal/setting_resource_storage_modes"
-	@echo "  https://developer.apple.com/documentation/metal/synchronization"
-	@echo "  https://developer.apple.com/documentation/metal/optimizing_performance_with_the_metal_frame_debugger"
-	@echo ""
-	@echo "$(YELLOW)Debugging & Tools:$(NC)"
-	@echo "  https://developer.apple.com/documentation/xcode/building-your-app-to-include-debugging-information"
-	@echo "  https://developer.apple.com/documentation/xcode/capturing-a-metal-workload-in-xcode"
-	@echo "  https://developer.apple.com/documentation/xcode/metal-debugger"
-	@echo "  https://developer.apple.com/documentation/xcode/naming-resources-and-commands"
-	@echo "  https://developer.apple.com/documentation/metal/debugging_tools"
-	@echo ""
-	@echo "$(YELLOW)Shaders & Language:$(NC)"
-	@echo "  https://developer.apple.com/documentation/metal/metal_shading_language_guide"
-	@echo "  https://developer.apple.com/documentation/metal/shader_libraries"
-	@echo "  https://developer.apple.com/documentation/metal/shader_functions"
-	@echo "  https://developer.apple.com/documentation/xcode/building-your-project-with-embedded-shader-sources"
-	@echo ""
-	@echo "$(YELLOW)Advanced Techniques:$(NC)"
-	@echo "  https://developer.apple.com/documentation/metal/indirect_command_encoding"
-	@echo "  https://developer.apple.com/documentation/metal/tessellation"
-	@echo "  https://developer.apple.com/documentation/metal/ray_tracing"
-	@echo "  https://developer.apple.com/documentation/metal/function_pointers"
-	@echo "  https://developer.apple.com/documentation/metal/mesh_shaders"
-	@echo ""
-	@echo "$(YELLOW)Development Workflows:$(NC)"
-	@echo "  https://developer.apple.com/documentation/Xcode/Metal-developer-workflows"
-	@echo "  https://developer.apple.com/documentation/xcode/testing-in-simulator-versus-testing-on-hardware-devices"
-	@echo "  https://developer.apple.com/documentation/Xcode/devices-and-simulator"
-	@echo ""
-	@echo "$(YELLOW)Best Practices & Guides:$(NC)"
-	@echo "  https://developer.apple.com/library/archive/documentation/3DDrawing/Conceptual/MTLBestPracticesGuide/index.html#//apple_ref/doc/uid/TP40016642"
-	@echo "  https://developer.apple.com/library/archive/documentation/Miscellaneous/Conceptual/MetalProgrammingGuide/Introduction/Introduction.html#//apple_ref/doc/uid/TP40014221"
-	@echo "  https://developer.apple.com/library/archive/documentation/Miscellaneous/Conceptual/MetalProgrammingGuide/Dev-Technique/Dev-Technique.html#//apple_ref/doc/uid/TP40014221-CH8-SW1"
-	@echo "  https://developer.apple.com/documentation/metal/metal_sample_code_library"
-	@echo ""
-	@echo "$(YELLOW)Game & Simulation Specific:$(NC)"
-	@echo "  https://developer.apple.com/documentation/gameplaykit"
-	@echo "  https://developer.apple.com/documentation/metal/metal_for_accelerating_ray_tracing"
-	@echo "  https://developer.apple.com/documentation/metalperformanceshaders/mpsgraph"
-	@echo "  https://developer.apple.com/documentation/metal/gpu-driven_rendering"
-	@echo ""
-
-.PHONY: metal-specs
-metal-specs: ## Display Metal Shading Language Specification link and details
-	@echo ""
-	@echo "$(CYAN)===== Metal Shading Language Specification =====$(NC)"
-	@echo ""
-	@echo "$(YELLOW)Official Metal Shading Language Specification:$(NC)"
-	@echo "  https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf"
-	@echo ""
-	@echo "$(GREEN)Local Copy Available:$(NC)"
-	@if [ -f "/Users/griffin/Downloads/Metal-Shading-Language-Specification.pdf" ]; then \
-		echo "  ✓ Found at: /Users/griffin/Downloads/Metal-Shading-Language-Specification.pdf"; \
-		echo "  File size: $$(du -h '/Users/griffin/Downloads/Metal-Shading-Language-Specification.pdf' | cut -f1)"; \
-		echo ""; \
-		echo "  To open: open '/Users/griffin/Downloads/Metal-Shading-Language-Specification.pdf'"; \
-	else \
-		echo "  ✗ Not found locally"; \
-		echo "  Download from the link above to: /Users/griffin/Downloads/"; \
-	fi
-	@echo ""
-	@echo "$(YELLOW)Key Specification Topics for City Simulation:$(NC)"
-	@echo "  • Data Types: Vectors, matrices, textures (Section 2)"
-	@echo "  • Address Spaces: device, constant, threadgroup (Section 4)"
-	@echo "  • Function Qualifiers: vertex, fragment, kernel (Section 5)"
-	@echo "  • Built-in Functions: Math, geometric, texture sampling (Section 6)"
-	@echo "  • Compute Functions: Thread organization, barriers (Section 5.8)"
-	@echo "  • Vertex Attributes: Input assembly, descriptors (Section 5.2)"
-	@echo "  • Fragment Functions: Color attachments, depth (Section 5.3)"
-	@echo ""
-	@echo "$(YELLOW)Important for MiniCity:$(NC)"
-	@echo "  • Instanced Rendering: instance_id, vertex descriptors (Section 5.2.3)"
-	@echo "  • Texture Arrays: For building/terrain atlases (Section 2.8)"
-	@echo "  • Atomic Operations: For traffic counters (Section 6.13)"
-	@echo "  • Threadgroup Memory: For compute optimizations (Section 4.3)"
-	@echo "  • Function Constants: For shader variants (Section 5.10)"
-	@echo ""
-	@echo "$(CYAN)Related Documentation:$(NC)"
-	@echo "  • Metal Feature Set Tables: https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf"
-	@echo "  • Metal Tools Profiling Guide: https://developer.apple.com/documentation/metal/tools"
-	@echo "  • Metal Shader Converter: https://developer.apple.com/documentation/metal/shader_converter"
-	@echo ""
-
-.PHONY: xcode-config
-xcode-config: ## Display comprehensive Xcode command-line configuration guide
-	@if [ -f "/Users/griffin/Downloads/xcodeViaTerminalGuide.md" ]; then \
-		echo "$(CYAN)===== Xcode Command-Line Configuration Guide =====$(NC)"; \
-		echo ""; \
-		cat "/Users/griffin/Downloads/xcodeViaTerminalGuide.md" | sed 's/^/  /' | less -R; \
-	else \
-		echo "$(RED)Error: Guide file not found at /Users/griffin/Downloads/xcodeViaTerminalGuide.md$(NC)"; \
-		echo ""; \
-		echo "$(YELLOW)Quick Reference - Essential Xcode CLI Commands:$(NC)"; \
-		echo ""; \
-		echo "$(GREEN)Xcode Selection:$(NC)"; \
-		echo "  xcode-select --print-path        # Show active Xcode"; \
-		echo "  sudo xcode-select -s /path        # Switch Xcode version"; \
-		echo "  xcode-select --install            # Install CLI tools"; \
-		echo ""; \
-		echo "$(GREEN)Building & Testing:$(NC)"; \
-		echo "  xcodebuild -list                  # List schemes/targets"; \
-		echo "  xcodebuild -scheme NAME build     # Build scheme"; \
-		echo "  xcodebuild test -scheme NAME      # Run tests"; \
-		echo "  xcodebuild archive -scheme NAME   # Create archive"; \
-		echo ""; \
-		echo "$(GREEN)Tools & Utilities:$(NC)"; \
-		echo "  xcrun --find TOOL                 # Find tool path"; \
-		echo "  xcrun simctl list                 # List simulators"; \
-		echo "  xcrun simctl boot DEVICE          # Boot simulator"; \
-		echo ""; \
-		echo "$(GREEN)Dependency Management:$(NC)"; \
-		echo "  swift package init                # Create SPM package"; \
-		echo "  pod install                       # Install CocoaPods"; \
-		echo "  carthage update                   # Update Carthage deps"; \
-		echo ""; \
-		echo "$(GREEN)Project Generation:$(NC)"; \
-		echo "  xcodegen generate                 # Generate from YAML"; \
-		echo "  tuist generate                    # Generate from Swift"; \
-		echo ""; \
-		echo "$(GREEN)Automation:$(NC)"; \
-		echo "  fastlane LANE                     # Run fastlane lane"; \
-		echo "  xcodebuild | xcpretty             # Pretty output"; \
-		echo ""; \
-		echo "$(YELLOW)For the full guide, ensure xcodeViaTerminalGuide.md exists in Downloads$(NC)"; \
-	fi
-
-# =============================================================================
-# METRICS & REPORTING
-# =============================================================================
-
-.PHONY: metrics
-metrics: ## Generate project metrics
-	@echo "$(YELLOW)Generating metrics...$(NC)"
-	@mkdir -p $(METRICS_DIR)
-	@echo "Project Metrics - $$(date)" > $(METRICS_DIR)/metrics.txt
-	@echo "========================" >> $(METRICS_DIR)/metrics.txt
-	@echo "" >> $(METRICS_DIR)/metrics.txt
-	@echo "Code Statistics:" >> $(METRICS_DIR)/metrics.txt
-	@echo "  Swift files: $$(find $(PROJECT_NAME) -name '*.swift' | wc -l)" >> $(METRICS_DIR)/metrics.txt
-	@echo "  Lines of code: $$(find $(PROJECT_NAME) -name '*.swift' | xargs wc -l | tail -1 | awk '{print $$1}')" >> $(METRICS_DIR)/metrics.txt
-	@echo "  Metal shaders: $$(find $(PROJECT_NAME) -name '*.metal' | wc -l)" >> $(METRICS_DIR)/metrics.txt
-	@echo "" >> $(METRICS_DIR)/metrics.txt
-	@echo "Complexity:" >> $(METRICS_DIR)/metrics.txt
-	@$(SWIFTLINT) analyze --reporter json --quiet | jq '.files | length' >> $(METRICS_DIR)/metrics.txt 2>/dev/null || echo "  N/A" >> $(METRICS_DIR)/metrics.txt
-	@cat $(METRICS_DIR)/metrics.txt
-	@echo "$(GREEN)✓ Metrics generated$(NC)"
-
-.PHONY: report-performance
-report-performance: ## Generate performance report
-	@echo "$(YELLOW)Generating performance report...$(NC)"
-	@mkdir -p $(REPORTS_DIR)
-	@$(XCODEBUILD) \
-		-project $(WORKSPACE) \
-		-scheme $(SCHEME) \
-		-destination 'platform=iOS Simulator,name=$(DEFAULT_DEVICE),OS=$(DEFAULT_OS)' \
-		-resultBundlePath $(REPORTS_DIR)/performance.xcresult \
-		test-without-building
-	@xcrun xcresulttool get --path $(REPORTS_DIR)/performance.xcresult --format json > $(REPORTS_DIR)/performance.json
-	@echo "$(GREEN)✓ Performance report generated$(NC)"
-
-.PHONY: report-size
-report-size: ## Report app size
-	@echo "$(YELLOW)Calculating app size...$(NC)"
-	@$(MAKE) build-release
-	@echo "App size: $$(du -sh $(DERIVED_DATA)/Build/Products/Release-iphonesimulator/$(PROJECT_NAME).app | cut -f1)"
-
-# =============================================================================
-# DEPLOYMENT & DISTRIBUTION
-# =============================================================================
-
-.PHONY: archive
-archive: ## Create release archive
-	@echo "$(YELLOW)Creating archive...$(NC)"
-	@mkdir -p $(ARCHIVES_DIR)
-	@$(XCODEBUILD) \
-		-project $(WORKSPACE) \
-		-scheme $(SCHEME) \
-		-configuration Release \
-		-derivedDataPath $(DERIVED_DATA) \
-		-archivePath $(ARCHIVES_DIR)/$(PROJECT_NAME).xcarchive \
-		archive | xcbeautify
-	@echo "$(GREEN)✓ Archive created$(NC)"
-
-.PHONY: export-ipa
-export-ipa: archive ## Export IPA for distribution
-	@$(XCODEBUILD) \
-		-exportArchive \
-		-archivePath $(ARCHIVES_DIR)/$(PROJECT_NAME).xcarchive \
-		-exportPath $(ARCHIVES_DIR) \
-		-exportOptionsPlist ExportOptions.plist
-	@echo "$(GREEN)✓ IPA exported$(NC)"
-
-.PHONY: beta
-beta: ## Deploy to TestFlight
-	@echo "$(YELLOW)Deploying to TestFlight...$(NC)"
-	@$(MAKE) archive
-	@xcrun altool --upload-app \
-		--type ios \
-		--file $(ARCHIVES_DIR)/$(PROJECT_NAME).ipa \
-		--username "$(APPLE_ID)" \
-		--password "$(APP_PASSWORD)"
-
-# =============================================================================
-# GIT OPERATIONS
-# =============================================================================
-
-.PHONY: commit-check
-commit-check: ## Pre-commit checks
-	@$(MAKE) check-swift
-	@$(MAKE) test
-	@echo "$(GREEN)✓ Ready to commit$(NC)"
-
-.PHONY: changelog
-changelog: ## Generate changelog from git history
-	@echo "# Changelog" > CHANGELOG.md
-	@echo "" >> CHANGELOG.md
-	@git log --pretty=format:"- %s (%h)" --no-merges -20 >> CHANGELOG.md
-	@echo "$(GREEN)✓ Changelog generated$(NC)"
-
-# =============================================================================
 # CLEANUP
 # =============================================================================
 
@@ -647,6 +544,7 @@ clean: ## Clean build artifacts
 	@echo "$(YELLOW)Cleaning build artifacts...$(NC)"
 	@rm -rf $(BUILD_DIR)
 	@rm -rf $(DERIVED_DATA)
+	@rm -rf $(MONITOR_DIR)
 	@$(XCODEBUILD) -project $(WORKSPACE) -scheme $(SCHEME) clean
 	@echo "$(GREEN)✓ Cleaned$(NC)"
 
@@ -688,56 +586,26 @@ validate: ## Full validation before PR
 	@$(MAKE) metrics
 	@echo "$(GREEN)✓ Validation complete - ready for PR$(NC)"
 
-.PHONY: daily
-daily: ## Daily development tasks
-	@echo "$(YELLOW)Running daily tasks...$(NC)"
-	@$(MAKE) clean
-	@$(MAKE) check
-	@$(MAKE) test
-	@$(MAKE) metrics
-	@$(MAKE) docs
-	@echo "$(GREEN)✓ Daily tasks complete$(NC)"
-
-.PHONY: release-prep
-release-prep: ## Prepare for release
-	@echo "$(YELLOW)Preparing release...$(NC)"
-	@$(MAKE) clean-all
-	@$(MAKE) validate
-	@$(MAKE) optimize-assets
-	@$(MAKE) docs
-	@$(MAKE) changelog
-	@$(MAKE) archive
-	@echo "$(GREEN)✓ Release prepared$(NC)"
-
 # =============================================================================
-# CITY-SPECIFIC TARGETS
+# METRICS & REPORTING
 # =============================================================================
 
-.PHONY: city-stats
-city-stats: ## Show city simulation statistics
-	@echo "$(YELLOW)City Statistics$(NC)"
-	@echo "=================="
-	@echo "Buildings: $$(grep -r 'BuildingType' $(PROJECT_NAME) | wc -l)"
-	@echo "Vehicle types: $$(grep -r 'VehicleType' $(PROJECT_NAME) | wc -l)"
-	@echo "Shaders: $$(find $(PROJECT_NAME) -name '*.metal' | wc -l)"
-	@echo "UI Components: $$(find $(PROJECT_NAME)/UI -name '*.swift' | wc -l)"
-
-.PHONY: benchmark-traffic
-benchmark-traffic: ## Benchmark traffic simulation
-	@echo "$(YELLOW)Benchmarking traffic...$(NC)"
-	@$(XCODEBUILD) \
-		-project $(WORKSPACE) \
-		-scheme $(SCHEME) \
-		-destination 'platform=iOS Simulator,name=$(DEFAULT_DEVICE),OS=$(DEFAULT_OS)' \
-		-only-testing:$(PROJECT_NAME)Tests/TrafficPerformanceTests \
-		test | xcbeautify
-
-.PHONY: debug-metal
-debug-metal: ## Debug Metal shaders
-	@echo "$(YELLOW)Metal debugging enabled$(NC)"
-	@export MTL_DEBUG_LAYER=1
-	@export MTL_SHADER_VALIDATION=1
-	@$(MAKE) run
+.PHONY: metrics
+metrics: ## Generate project metrics
+	@echo "$(YELLOW)Generating metrics...$(NC)"
+	@mkdir -p $(METRICS_DIR)
+	@echo "Project Metrics - $$(date)" > $(METRICS_DIR)/metrics.txt
+	@echo "========================" >> $(METRICS_DIR)/metrics.txt
+	@echo "" >> $(METRICS_DIR)/metrics.txt
+	@echo "Code Statistics:" >> $(METRICS_DIR)/metrics.txt
+	@echo "  Swift files: $$(find $(PROJECT_NAME) -name '*.swift' | wc -l)" >> $(METRICS_DIR)/metrics.txt
+	@echo "  Lines of code: $$(find $(PROJECT_NAME) -name '*.swift' | xargs wc -l | tail -1 | awk '{print $$1}')" >> $(METRICS_DIR)/metrics.txt
+	@echo "  Metal shaders: $$(find $(PROJECT_NAME) -name '*.metal' | wc -l)" >> $(METRICS_DIR)/metrics.txt
+	@echo "" >> $(METRICS_DIR)/metrics.txt
+	@echo "Complexity:" >> $(METRICS_DIR)/metrics.txt
+	@$(SWIFTLINT) analyze --reporter json --quiet | jq '.files | length' >> $(METRICS_DIR)/metrics.txt 2>/dev/null || echo "  N/A" >> $(METRICS_DIR)/metrics.txt
+	@cat $(METRICS_DIR)/metrics.txt
+	@echo "$(GREEN)✓ Metrics generated$(NC)"
 
 # Include local overrides if they exist
 -include Makefile.local

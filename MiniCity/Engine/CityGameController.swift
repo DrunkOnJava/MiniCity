@@ -340,6 +340,11 @@ extension CityGameController: HUDOverlayDelegate {
         }
     }
     
+    func handleTapAtWorldPosition(_ position: SIMD3<Float>) {
+        // Call the existing building placement method
+        hudOverlay?.placeBuildingAt(position: position)
+    }
+    
     func hudOverlay(_ overlay: HUDOverlay, didPlaceBuildingAt position: SIMD3<Float>) {
         let gridPos = cityGrid.worldToGrid(position)
         

@@ -351,6 +351,11 @@ class HUDOverlay: UIView {
         }
     }
     
+    func placeBuildingAt(position: SIMD3<Float>) {
+        // Notify delegate about building placement
+        delegate?.hudOverlay(self, didPlaceBuildingAt: position)
+    }
+    
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         // Allow touches to pass through except on UI elements
         let hitView = super.hitTest(point, with: event)

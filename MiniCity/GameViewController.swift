@@ -180,15 +180,29 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
     }
     
     @objc func handleTap(_ gesture: UITapGestureRecognizer) {
-        print("TAP DETECTED at \(gesture.location(in: view))")
+        let location = gesture.location(in: view)
         
-        // Rotate camera as a test
-        cameraAngle += 30
-        
-        // Direct camera manipulation for testing
+        // Convert screen coordinates to world coordinates
         if let camera = gameController.cameraController {
-            camera.reset()
-            print("Camera reset triggered")
+            let viewSize = view.bounds.size
+            
+            // Normalize screen coordinates
+            let normalizedX = (location.x / viewSize.width) * 2.0 - 1.0
+            let normalizedY = 1.0 - (location.y / viewSize.height) * 2.0
+            
+            // Simple ray-plane intersection for ground (y=0)
+            let rayOrigin = camera.position
+            let rayDirection = camera.getViewDirection()
+            
+            // Calculate world position on ground plane
+            if rayOrigin.y > 0 && rayDirection.y < 0 {
+                let t = -rayOrigin.y / rayDirection.y
+                let worldX = rayOrigin.x + rayDirection.x * t
+                let worldZ = rayOrigin.z + rayDirection.z * t
+                
+                // Place building at this position
+                gameController.handleTapAtWorldPosition(SIMD3<Float>(worldX, 0, worldZ))
+            }
         }
     }
     

@@ -1,0 +1,73 @@
+# Claude Code Quick Reference
+
+## Primary Command (Use This!)
+
+```bash
+cd /Users/griffin/Projects/MiniCity/MiniCity
+./claude_code_run.sh
+```
+
+This single command will:
+- Start monitoring
+- Build the app
+- Run in simulator
+- Detect crashes
+- Provide diagnostics
+- Attempt auto-recovery
+
+## Alternative Commands
+
+```bash
+# Standard monitoring run
+make claude-run
+
+# Get diagnostics only
+make claude-diagnose
+
+# Check current status
+make claude-status
+
+# View suggested fixes
+make claude-fix
+
+# Clean monitoring data
+make claude-clean
+```
+
+## Reading Output
+
+Look for these markers in the output:
+
+- `CLAUDE_CODE_CRASH`: App crashed (diagnostics follow)
+- `CLAUDE_CODE_BUILD_FAILED`: Compilation error
+- `CLAUDE_CODE_SUCCESS`: App running stable
+- `CLAUDE_CODE_ACTION_REQUIRED`: Needs manual fix
+
+## Example Usage
+
+```bash
+# Simple run
+./claude_code_run.sh
+
+# With output parsing
+./claude_code_run.sh | grep CLAUDE_CODE
+
+# Save diagnostics
+./claude_code_run.sh > run_log.txt 2>&1
+```
+
+## Crash Response
+
+When a crash is detected:
+
+1. Read the diagnostic JSON
+2. Check `crash_analysis.crash_type`
+3. Review `suggested_fixes`
+4. Apply code changes
+5. Run again
+
+## Files to Check
+
+- Status: `/tmp/minicity_monitor/current_status.json`
+- Diagnostics: `build/last_diagnostic.json`
+- Build log: `build/last_build.log`

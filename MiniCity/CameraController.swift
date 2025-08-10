@@ -426,6 +426,12 @@ class CameraController: NSObject {
         }
         updateCameraPosition()
     }
+    
+    func getViewDirection() -> SIMD3<Float> {
+        // Calculate view direction from camera to target
+        let direction = normalize(target - position)
+        return direction
+    }
 }
 
 // Matrix math functions are now in MathExtensions.swift
