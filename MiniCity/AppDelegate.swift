@@ -14,7 +14,16 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-        // Override point for customization after application launch.
+        // Create window programmatically
+        window = UIWindow(frame: UIScreen.main.bounds)
+        
+        // Use the Metal-based view controller
+        let storyboard = UIStoryboard(name: "Main", bundle: nil)
+        if let viewController = storyboard.instantiateInitialViewController() {
+            window?.rootViewController = viewController
+            window?.makeKeyAndVisible()
+        }
+        
         return true
     }
 

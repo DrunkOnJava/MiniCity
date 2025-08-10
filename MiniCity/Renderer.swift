@@ -27,21 +27,35 @@ class Renderer: NSObject, MTKViewDelegate {
     var dynamicUniformBuffer: MTLBuffer
     var pipelineState: MTLRenderPipelineState
     var depthState: MTLDepthStencilState
-    var colorMap: MTLTexture
     
     let inFlightSemaphore = DispatchSemaphore(value: maxBuffersInFlight)
     
     var uniformBufferOffset = 0
-    
     var uniformBufferIndex = 0
-    
     var uniforms: UnsafeMutablePointer<Uniforms>
     
     var projectionMatrix: matrix_float4x4 = matrix_float4x4()
+    var viewMatrix: matrix_float4x4 = matrix_float4x4()
     
-    var rotation: Float = 0
+    // Camera controller reference
+    var cameraController: CameraController?
     
-    var mesh: MTKMesh
+    // Grid properties
+    let gridSize = 100
+    let cellSize: Float = 1.0
+    var gridVertexBuffer: MTLBuffer!
+    var gridIndexBuffer: MTLBuffer!
+    var gridIndexCount: Int = 0
+    
+    // Ground plane
+    var groundVertexBuffer: MTLBuffer!
+    var groundIndexBuffer: MTLBuffer!
+    var groundTexture: MTLTexture!
+    var groundPipelineState: MTLRenderPipelineState!
+    var groundRenderer: GroundRenderer!
+    
+    // City elements
+    var cityBuilder: CityBuilder!
     
     @MainActor
     init?(metalKitView: MTKView) {
@@ -74,27 +88,34 @@ class Renderer: NSObject, MTKViewDelegate {
         }
         
         let depthStateDescriptor = MTLDepthStencilDescriptor()
-        depthStateDescriptor.depthCompareFunction = MTLCompareFunction.less
+        depthStateDescriptor.depthCompareFunction = MTLCompareFunction.lessEqual
         depthStateDescriptor.isDepthWriteEnabled = true
+        depthStateDescriptor.label = "Depth State"
         guard let state = device.makeDepthStencilState(descriptor:depthStateDescriptor) else { return nil }
         depthState = state
         
-        do {
-            mesh = try Renderer.buildMesh(device: device, mtlVertexDescriptor: mtlVertexDescriptor)
-        } catch {
-            print("Unable to build MetalKit Mesh. Error info: \(error)")
-            return nil
-        }
-        
-        do {
-            colorMap = try Renderer.loadTexture(device: device, textureName: "ColorMap")
-        } catch {
-            print("Unable to load texture. Error info: \(error)")
-            return nil
-        }
-        
         super.init()
         
+        // Build city grid and ground
+        buildCityGrid()
+        buildGroundPlane()
+        createGroundTexture()
+        
+        // Create the new ground renderer
+        groundRenderer = GroundRenderer(device: device)
+        
+        // Create city elements
+        cityBuilder = CityBuilder(device: device)
+        cityBuilder.generateCity()
+        
+        // Build ground pipeline
+        do {
+            groundPipelineState = try buildGroundPipeline(device: device, metalKitView: metalKitView)
+            print("Ground pipeline created successfully")
+        } catch {
+            print("Failed to create ground pipeline: \(error)")
+            groundPipelineState = nil
+        }
     }
     
     class func buildMetalVertexDescriptor() -> MTLVertexDescriptor {
@@ -130,15 +151,15 @@ class Renderer: NSObject, MTKViewDelegate {
         
         let library = device.makeDefaultLibrary()
         
-        let vertexFunction = library?.makeFunction(name: "vertexShader")
-        let fragmentFunction = library?.makeFunction(name: "fragmentShader")
+        let vertexFunction = library?.makeFunction(name: "gridVertexShader")
+        let fragmentFunction = library?.makeFunction(name: "gridFragmentShader")
         
         let pipelineDescriptor = MTLRenderPipelineDescriptor()
         pipelineDescriptor.label = "RenderPipeline"
         pipelineDescriptor.rasterSampleCount = metalKitView.sampleCount
         pipelineDescriptor.vertexFunction = vertexFunction
         pipelineDescriptor.fragmentFunction = fragmentFunction
-        pipelineDescriptor.vertexDescriptor = mtlVertexDescriptor
+        pipelineDescriptor.vertexDescriptor = nil  // We're using vertex ID indexing
         
         pipelineDescriptor.colorAttachments[0].pixelFormat = metalKitView.colorPixelFormat
         pipelineDescriptor.depthAttachmentPixelFormat = metalKitView.depthStencilPixelFormat
@@ -147,48 +168,48 @@ class Renderer: NSObject, MTKViewDelegate {
         return try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
     }
     
-    class func buildMesh(device: MTLDevice,
-                         mtlVertexDescriptor: MTLVertexDescriptor) throws -> MTKMesh {
-        /// Create and condition mesh data to feed into a pipeline using the given vertex descriptor
+    func buildCityGrid() {
+        // Create grid vertices and indices
+        var vertices: [Float] = []
+        var indices: [UInt16] = []
         
-        let metalAllocator = MTKMeshBufferAllocator(device: device)
-        
-        let mdlMesh = MDLMesh.newBox(withDimensions: SIMD3<Float>(4, 4, 4),
-                                     segments: SIMD3<UInt32>(2, 2, 2),
-                                     geometryType: MDLGeometryType.triangles,
-                                     inwardNormals:false,
-                                     allocator: metalAllocator)
-        
-        let mdlVertexDescriptor = MTKModelIOVertexDescriptorFromMetal(mtlVertexDescriptor)
-        
-        guard let attributes = mdlVertexDescriptor.attributes as? [MDLVertexAttribute] else {
-            throw RendererError.badVertexDescriptor
+        // Generate grid lines
+        for i in 0...gridSize {
+            let pos = Float(i) * cellSize - Float(gridSize) * cellSize * 0.5
+            
+            // Horizontal lines (slightly raised to avoid z-fighting)
+            vertices += [
+                -Float(gridSize) * cellSize * 0.5, 0.01, pos,  // Start point
+                0.9, 0.9, 0.9,  // Color (light gray)
+                Float(gridSize) * cellSize * 0.5, 0.01, pos,   // End point
+                0.9, 0.9, 0.9   // Color
+            ]
+            
+            // Vertical lines
+            vertices += [
+                pos, 0.01, -Float(gridSize) * cellSize * 0.5,  // Start point
+                0.9, 0.9, 0.9,  // Color
+                pos, 0.01, Float(gridSize) * cellSize * 0.5,   // End point
+                0.9, 0.9, 0.9   // Color
+            ]
         }
-        attributes[VertexAttribute.position.rawValue].name = MDLVertexAttributePosition
-        attributes[VertexAttribute.texcoord.rawValue].name = MDLVertexAttributeTextureCoordinate
         
-        mdlMesh.vertexDescriptor = mdlVertexDescriptor
+        // Generate indices for line segments
+        for i in 0..<(gridSize + 1) * 4 {
+            indices.append(UInt16(i))
+        }
         
-        return try MTKMesh(mesh:mdlMesh, device:device)
+        gridIndexCount = indices.count
+        
+        // Create buffers
+        gridVertexBuffer = device.makeBuffer(bytes: vertices,
+                                            length: vertices.count * MemoryLayout<Float>.size,
+                                            options: [])
+        gridIndexBuffer = device.makeBuffer(bytes: indices,
+                                           length: indices.count * MemoryLayout<UInt16>.size,
+                                           options: [])
     }
     
-    class func loadTexture(device: MTLDevice,
-                           textureName: String) throws -> MTLTexture {
-        /// Load texture data with optimal parameters for sampling
-        
-        let textureLoader = MTKTextureLoader(device: device)
-        
-        let textureLoaderOptions = [
-            MTKTextureLoader.Option.textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
-            MTKTextureLoader.Option.textureStorageMode: NSNumber(value: MTLStorageMode.`private`.rawValue)
-        ]
-        
-        return try textureLoader.newTexture(name: textureName,
-                                            scaleFactor: 1.0,
-                                            bundle: nil,
-                                            options: textureLoaderOptions)
-        
-    }
     
     private func updateDynamicBufferState() {
         /// Update the state of our uniform buffers before rendering
@@ -205,11 +226,19 @@ class Renderer: NSObject, MTKViewDelegate {
         
         uniforms[0].projectionMatrix = projectionMatrix
         
-        let rotationAxis = SIMD3<Float>(1, 1, 0)
-        let modelMatrix = matrix4x4_rotation(radians: rotation, axis: rotationAxis)
-        let viewMatrix = matrix4x4_translation(0.0, 0.0, -8.0)
-        uniforms[0].modelViewMatrix = simd_mul(viewMatrix, modelMatrix)
-        rotation += 0.01
+        // Get view matrix from camera controller
+        if let cameraController = cameraController {
+            let viewMatrix = cameraController.getViewMatrix()
+            uniforms[0].modelViewMatrix = viewMatrix
+        } else {
+            // Default view matrix if no camera controller
+            let defaultView = matrix_look_at_right_hand(
+                eye: SIMD3<Float>(50, 50, 50),
+                target: SIMD3<Float>(0, 0, 0),
+                up: SIMD3<Float>(0, 1, 0)
+            )
+            uniforms[0].modelViewMatrix = defaultView
+        }
     }
     
     func draw(in view: MTKView) {
@@ -232,6 +261,9 @@ class Renderer: NSObject, MTKViewDelegate {
             ///   holding onto the drawable and blocking the display pipeline any longer than necessary
             let renderPassDescriptor = view.currentRenderPassDescriptor
             
+            // Set clear color to sky blue with fog
+            renderPassDescriptor?.colorAttachments[0].clearColor = MTLClearColor(red: 0.53, green: 0.81, blue: 0.98, alpha: 1.0)
+            
             if let renderPassDescriptor = renderPassDescriptor, let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) {
                 
                 /// Final pass rendering code here
@@ -247,30 +279,72 @@ class Renderer: NSObject, MTKViewDelegate {
                 
                 renderEncoder.setDepthStencilState(depthState)
                 
-                renderEncoder.setVertexBuffer(dynamicUniformBuffer, offset:uniformBufferOffset, index: BufferIndex.uniforms.rawValue)
-                renderEncoder.setFragmentBuffer(dynamicUniformBuffer, offset:uniformBufferOffset, index: BufferIndex.uniforms.rawValue)
+                // Draw the new checkerboard ground first
+                groundRenderer.draw(in: renderEncoder, uniforms: dynamicUniformBuffer, offset: uniformBufferOffset)
                 
-                for (index, element) in mesh.vertexDescriptor.layouts.enumerated() {
-                    guard let layout = element as? MDLVertexBufferLayout else {
-                        return
-                    }
-                    
-                    if layout.stride != 0 {
-                        let buffer = mesh.vertexBuffers[index]
-                        renderEncoder.setVertexBuffer(buffer.buffer, offset:buffer.offset, index: index)
-                    }
+                // Draw roads
+                if let roadVertexBuffer = cityBuilder.roadVertexBuffer,
+                   let roadIndexBuffer = cityBuilder.roadIndexBuffer,
+                   cityBuilder.roadIndexCount > 0 {
+                    renderEncoder.setRenderPipelineState(pipelineState)
+                    renderEncoder.setVertexBuffer(dynamicUniformBuffer, offset:uniformBufferOffset, index: BufferIndex.uniforms.rawValue)
+                    renderEncoder.setFragmentBuffer(dynamicUniformBuffer, offset:uniformBufferOffset, index: BufferIndex.uniforms.rawValue)
+                    renderEncoder.setVertexBuffer(roadVertexBuffer, offset: 0, index: 0)
+                    renderEncoder.drawIndexedPrimitives(type: .triangle,
+                                                       indexCount: cityBuilder.roadIndexCount,
+                                                       indexType: .uint16,
+                                                       indexBuffer: roadIndexBuffer,
+                                                       indexBufferOffset: 0)
                 }
                 
-                renderEncoder.setFragmentTexture(colorMap, index: TextureIndex.color.rawValue)
-                
-                for submesh in mesh.submeshes {
-                    renderEncoder.drawIndexedPrimitives(type: submesh.primitiveType,
-                                                        indexCount: submesh.indexCount,
-                                                        indexType: submesh.indexType,
-                                                        indexBuffer: submesh.indexBuffer.buffer,
-                                                        indexBufferOffset: submesh.indexBuffer.offset)
-                    
+                // Draw parks
+                if let parkGen = cityBuilder.parkGenerator,
+                   let parkVertexBuffer = parkGen.parkVertexBuffer,
+                   let parkIndexBuffer = parkGen.parkIndexBuffer,
+                   parkGen.parkIndexCount > 0 {
+                    renderEncoder.setRenderPipelineState(pipelineState)
+                    renderEncoder.setVertexBuffer(dynamicUniformBuffer, offset:uniformBufferOffset, index: BufferIndex.uniforms.rawValue)
+                    renderEncoder.setFragmentBuffer(dynamicUniformBuffer, offset:uniformBufferOffset, index: BufferIndex.uniforms.rawValue)
+                    renderEncoder.setVertexBuffer(parkVertexBuffer, offset: 0, index: 0)
+                    renderEncoder.drawIndexedPrimitives(type: .triangle,
+                                                       indexCount: parkGen.parkIndexCount,
+                                                       indexType: .uint16,
+                                                       indexBuffer: parkIndexBuffer,
+                                                       indexBufferOffset: 0)
                 }
+                
+                // Draw trees
+                if let parkGen = cityBuilder.parkGenerator,
+                   let treeVertexBuffer = parkGen.treeVertexBuffer,
+                   let treeIndexBuffer = parkGen.treeIndexBuffer,
+                   parkGen.treeIndexCount > 0 {
+                    renderEncoder.setRenderPipelineState(pipelineState)
+                    renderEncoder.setVertexBuffer(dynamicUniformBuffer, offset:uniformBufferOffset, index: BufferIndex.uniforms.rawValue)
+                    renderEncoder.setFragmentBuffer(dynamicUniformBuffer, offset:uniformBufferOffset, index: BufferIndex.uniforms.rawValue)
+                    renderEncoder.setVertexBuffer(treeVertexBuffer, offset: 0, index: 0)
+                    renderEncoder.drawIndexedPrimitives(type: .triangle,
+                                                       indexCount: parkGen.treeIndexCount,
+                                                       indexType: .uint16,
+                                                       indexBuffer: treeIndexBuffer,
+                                                       indexBufferOffset: 0)
+                }
+                
+                // Draw buildings
+                if let buildingVertexBuffer = cityBuilder.buildingVertexBuffer,
+                   let buildingIndexBuffer = cityBuilder.buildingIndexBuffer,
+                   cityBuilder.buildingIndexCount > 0 {
+                    renderEncoder.setRenderPipelineState(pipelineState)
+                    renderEncoder.setVertexBuffer(dynamicUniformBuffer, offset:uniformBufferOffset, index: BufferIndex.uniforms.rawValue)
+                    renderEncoder.setFragmentBuffer(dynamicUniformBuffer, offset:uniformBufferOffset, index: BufferIndex.uniforms.rawValue)
+                    renderEncoder.setVertexBuffer(buildingVertexBuffer, offset: 0, index: 0)
+                    renderEncoder.drawIndexedPrimitives(type: .triangle,
+                                                       indexCount: cityBuilder.buildingIndexCount,
+                                                       indexType: .uint16,
+                                                       indexBuffer: buildingIndexBuffer,
+                                                       indexBufferOffset: 0)
+                }
+                
+                // Grid lines removed - checkerboard provides visual reference
                 
                 renderEncoder.popDebugGroup()
                 
@@ -289,40 +363,115 @@ class Renderer: NSObject, MTKViewDelegate {
         /// Respond to drawable size or orientation changes here
         
         let aspect = Float(size.width) / Float(size.height)
-        projectionMatrix = matrix_perspective_right_hand(fovyRadians: radians_from_degrees(65), aspectRatio:aspect, nearZ: 0.1, farZ: 100.0)
+        projectionMatrix = matrix_perspective_right_hand(fovyRadians: radians(fromDegrees: 65), aspectRatio:aspect, nearZ: 0.1, farZ: 100.0)
+    }
+    
+    func buildGroundPlane() {
+        let halfSize = Float(gridSize) * cellSize * 0.5
+        
+        // Just positions for simple test
+        let vertices: [SIMD3<Float>] = [
+            SIMD3<Float>(-halfSize, -0.1, -halfSize),  // Bottom-left
+            SIMD3<Float>( halfSize, -0.1, -halfSize),  // Bottom-right  
+            SIMD3<Float>( halfSize, -0.1,  halfSize),  // Top-right
+            SIMD3<Float>(-halfSize, -0.1,  halfSize)   // Top-left
+        ]
+        
+        let indices: [UInt16] = [
+            0, 1, 2,  // First triangle
+            0, 2, 3   // Second triangle
+        ]
+        
+        groundVertexBuffer = device.makeBuffer(bytes: vertices,
+                                              length: vertices.count * MemoryLayout<SIMD3<Float>>.size,
+                                              options: [])
+        groundIndexBuffer = device.makeBuffer(bytes: indices,
+                                            length: indices.count * MemoryLayout<UInt16>.size,
+                                            options: [])
+        
+        print("Ground buffers created - vertex: \(groundVertexBuffer != nil), index: \(groundIndexBuffer != nil)")
+        print("Ground size: \(halfSize * 2) x \(halfSize * 2)")
+    }
+    
+    func createGroundTexture() {
+        let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba8Unorm,
+            width: 512,
+            height: 512,
+            mipmapped: true
+        )
+        textureDescriptor.usage = [.shaderRead]
+        
+        groundTexture = device.makeTexture(descriptor: textureDescriptor)
+        
+        // Create a grass-like texture procedurally
+        var pixels = [UInt8](repeating: 0, count: 512 * 512 * 4)
+        
+        for y in 0..<512 {
+            for x in 0..<512 {
+                let index = (y * 512 + x) * 4
+                
+                // Add some noise for grass variation
+                let noise = Float.random(in: 0...1)
+                let baseGreen = UInt8(80 + noise * 40)  // Vary green from 80-120
+                let darkFactor = UInt8(noise * 20)
+                
+                pixels[index] = 30 + darkFactor      // R (dark green)
+                pixels[index + 1] = baseGreen        // G (main green)
+                pixels[index + 2] = 20 + darkFactor  // B (slight blue tint)
+                pixels[index + 3] = 255               // A (opaque)
+            }
+        }
+        
+        groundTexture.replace(region: MTLRegionMake2D(0, 0, 512, 512),
+                             mipmapLevel: 0,
+                             withBytes: pixels,
+                             bytesPerRow: 512 * 4)
+    }
+    
+    func buildGroundPipeline(device: MTLDevice, metalKitView: MTKView) throws -> MTLRenderPipelineState {
+        let library = device.makeDefaultLibrary()
+        
+        // Try simple shader first
+        var vertexFunction = library?.makeFunction(name: "simpleGroundVertex")
+        var fragmentFunction = library?.makeFunction(name: "simpleGroundFragment")
+        
+        if vertexFunction == nil {
+            print("ERROR: Could not find simpleGroundVertex shader")
+            // Fallback to original shader
+            vertexFunction = library?.makeFunction(name: "groundVertexShader")
+            fragmentFunction = library?.makeFunction(name: "groundFragmentShader")
+            
+            if vertexFunction == nil {
+                print("ERROR: Could not find groundVertexShader either")
+            }
+        }
+        
+        // Create vertex descriptor for simple vertex
+        let vertexDescriptor = MTLVertexDescriptor()
+        vertexDescriptor.attributes[0].format = .float3
+        vertexDescriptor.attributes[0].offset = 0
+        vertexDescriptor.attributes[0].bufferIndex = 0
+        vertexDescriptor.layouts[0].stride = MemoryLayout<SIMD3<Float>>.stride
+        
+        let pipelineDescriptor = MTLRenderPipelineDescriptor()
+        pipelineDescriptor.label = "GroundPipeline"
+        pipelineDescriptor.rasterSampleCount = metalKitView.sampleCount
+        pipelineDescriptor.vertexFunction = vertexFunction
+        pipelineDescriptor.fragmentFunction = fragmentFunction
+        pipelineDescriptor.vertexDescriptor = vertexDescriptor
+        
+        pipelineDescriptor.colorAttachments[0].pixelFormat = metalKitView.colorPixelFormat
+        pipelineDescriptor.depthAttachmentPixelFormat = metalKitView.depthStencilPixelFormat
+        pipelineDescriptor.stencilAttachmentPixelFormat = metalKitView.depthStencilPixelFormat
+        
+        return try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
     }
 }
 
-// Generic matrix math utility functions
-func matrix4x4_rotation(radians: Float, axis: SIMD3<Float>) -> matrix_float4x4 {
-    let unitAxis = normalize(axis)
-    let ct = cosf(radians)
-    let st = sinf(radians)
-    let ci = 1 - ct
-    let x = unitAxis.x, y = unitAxis.y, z = unitAxis.z
-    return matrix_float4x4.init(columns:(vector_float4(    ct + x * x * ci, y * x * ci + z * st, z * x * ci - y * st, 0),
-                                         vector_float4(x * y * ci - z * st,     ct + y * y * ci, z * y * ci + x * st, 0),
-                                         vector_float4(x * z * ci + y * st, y * z * ci - x * st,     ct + z * z * ci, 0),
-                                         vector_float4(                  0,                   0,                   0, 1)))
+// Matrix math functions are in MathExtensions.swift
+func radians(fromDegrees degrees: Float) -> Float {
+    return degrees * Float.pi / 180
 }
 
-func matrix4x4_translation(_ translationX: Float, _ translationY: Float, _ translationZ: Float) -> matrix_float4x4 {
-    return matrix_float4x4.init(columns:(vector_float4(1, 0, 0, 0),
-                                         vector_float4(0, 1, 0, 0),
-                                         vector_float4(0, 0, 1, 0),
-                                         vector_float4(translationX, translationY, translationZ, 1)))
-}
-
-func matrix_perspective_right_hand(fovyRadians fovy: Float, aspectRatio: Float, nearZ: Float, farZ: Float) -> matrix_float4x4 {
-    let ys = 1 / tanf(fovy * 0.5)
-    let xs = ys / aspectRatio
-    let zs = farZ / (nearZ - farZ)
-    return matrix_float4x4.init(columns:(vector_float4(xs,  0, 0,   0),
-                                         vector_float4( 0, ys, 0,   0),
-                                         vector_float4( 0,  0, zs, -1),
-                                         vector_float4( 0,  0, zs * nearZ, 0)))
-}
-
-func radians_from_degrees(_ degrees: Float) -> Float {
-    return (degrees / 180) * .pi
-}
+// Matrix functions are now in MathExtensions.swift
